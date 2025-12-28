@@ -1,0 +1,6 @@
+.env
+node_modules/
+# Generated results files (e.g., wantlist-results-2025-12-28T00-12-15.csv)
+wantlist-results-*.csv
+wantlist.csv
+.DS_Store

@@ -1,0 +1,17 @@
+{
+  "name": "wantlist",
+  "type": "module",
+  "version": "1.0.0",
+  "main": "index.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "tsx index.ts"
+  },
+  "dependencies": {
+    "@lionralfs/discogs-client": "^4.1.4",
+    "csv-parse": "^5.5.6"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3"
+  }
+}
