@@ -2,13 +2,23 @@ import { DiscogsClient } from "@lionralfs/discogs-client";
 import { parse } from "csv-parse/sync";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  WANTLIST_CSV_PATH,
+  MIN_YEAR,
+  RATE_LIMIT,
+  RETRY,
+  PROGRESS,
+  DEFAULTS,
+  API,
+  CSV_OUTPUT,
+} from "./config.js";
 
 type ReleaseInfo = {
   releaseId: number;
   artist?: string;
   title?: string;
-  hasPost2015Release: boolean;
-  post2015Releases: Array<{
+  hasPostMinYearRelease: boolean;
+  postMinYearReleases: Array<{
     id: number;
     title: string;
     year: number;
@@ -28,17 +38,17 @@ type CsvRow = {
   Notes: string;
 };
 
-// Rate limiter that tracks requests in a 60-second sliding window
+// Rate limiter that tracks requests in a sliding window
 class RateLimiter {
   private requestTimestamps: number[] = [];
   private maxRequests: number;
-  private windowMs = 60000; // 60 seconds
+  private windowMs = RATE_LIMIT.WINDOW_MS;
 
   constructor(maxRequests: number) {
     this.maxRequests = maxRequests;
   }
 
-  // Clean up old requests outside the 60-second window
+  // Clean up old requests outside the window
   private cleanup(): void {
     const now = Date.now();
     this.requestTimestamps = this.requestTimestamps.filter(
@@ -70,11 +80,11 @@ class RateLimiter {
     const remaining = remainingFromHeader !== undefined ? remainingFromHeader : this.getRemaining();
 
     // If we're close to the limit, wait
-    if (remaining <= 2) {
+    if (remaining <= RATE_LIMIT.WAIT_THRESHOLD) {
       // Calculate how long to wait until the oldest request falls out of the window
       if (this.requestTimestamps.length > 0) {
         const oldestRequest = this.requestTimestamps[0];
-        const waitTime = this.windowMs - (Date.now() - oldestRequest) + 100; // Add 100ms buffer
+        const waitTime = this.windowMs - (Date.now() - oldestRequest) + RATE_LIMIT.BUFFER_MS;
         if (waitTime > 0) {
           console.log(`⏳ Rate limit: ${requestsInWindow}/${this.maxRequests} used. Waiting ${Math.ceil(waitTime / 1000)}s...`);
           await sleep(waitTime);
@@ -82,7 +92,7 @@ class RateLimiter {
         }
       } else {
         // Conservative delay if we don't have timing info
-        await sleep(1000);
+        await sleep(RATE_LIMIT.CONSERVATIVE_DELAY_MS);
       }
     }
   }
@@ -96,23 +106,23 @@ const getClient = (): DiscogsClient => {
 
   if (userToken) {
     isAuthenticated = true;
-    rateLimiter = new RateLimiter(60); // Authenticated: 60 req/min
+    rateLimiter = new RateLimiter(RATE_LIMIT.AUTHENTICATED_REQUESTS_PER_MINUTE);
     return new DiscogsClient({
-      userAgent: "wantlist-checker/1.0",
+      userAgent: API.USER_AGENT,
       auth: { userToken },
     });
   }
 
-  // Fallback to unauthenticated client (limited to 25 requests/minute)
+  // Fallback to unauthenticated client
   isAuthenticated = false;
-  rateLimiter = new RateLimiter(25); // Unauthenticated: 25 req/min
+  rateLimiter = new RateLimiter(RATE_LIMIT.UNAUTHENTICATED_REQUESTS_PER_MINUTE);
   console.warn(
-    "⚠️  Warning: No authentication provided. Using unauthenticated mode (25 req/min limit).\n" +
-      "   For better rate limits (60 req/min), set DISCOGS_USER_TOKEN environment variable.\n" +
+    `⚠️  Warning: No authentication provided. Using unauthenticated mode (${RATE_LIMIT.UNAUTHENTICATED_REQUESTS_PER_MINUTE} req/min limit).\n` +
+      `   For better rate limits (${RATE_LIMIT.AUTHENTICATED_REQUESTS_PER_MINUTE} req/min), set DISCOGS_USER_TOKEN environment variable.\n` +
       "   Get your token at: https://www.discogs.com/settings/developers\n"
   );
   return new DiscogsClient({
-    userAgent: "wantlist-checker/1.0",
+    userAgent: API.USER_AGENT,
   });
 };
 
@@ -120,15 +130,15 @@ const sleep = (ms: number): Promise<void> => {
   return new Promise((resolve) => setTimeout(resolve, ms));
 };
 
-const checkReleaseForPost2015Versions = async (
+const checkReleaseForPostMinYearVersions = async (
   client: DiscogsClient,
   releaseId: number,
   artist?: string,
   title?: string,
   retryCount = 0
 ): Promise<ReleaseInfo> => {
-  const maxRetries = 5;
-  const baseDelay = 60000; // 1 minute base delay for rate limit errors
+  const maxRetries = RETRY.MAX_RETRIES;
+  const baseDelay = RETRY.BASE_DELAY_MS;
 
   try {
     // Wait if needed before making request
@@ -152,7 +162,7 @@ const checkReleaseForPost2015Versions = async (
           `⚠️  Rate limit hit for release ${releaseId}. Waiting ${delay / 1000}s before retry ${retryCount + 1}/${maxRetries}...`
         );
         await sleep(delay);
-        return checkReleaseForPost2015Versions(client, releaseId, artist, title, retryCount + 1);
+        return checkReleaseForPostMinYearVersions(client, releaseId, artist, title, retryCount + 1);
       }
       throw error;
     }
@@ -164,8 +174,8 @@ const checkReleaseForPost2015Versions = async (
         releaseId,
         artist,
         title,
-        hasPost2015Release: false,
-        post2015Releases: [],
+        hasPostMinYearRelease: false,
+        postMinYearReleases: [],
       };
     }
 
@@ -190,22 +200,22 @@ const checkReleaseForPost2015Versions = async (
           `⚠️  Rate limit hit for master ${release.master_id}. Waiting ${delay / 1000}s before retry ${retryCount + 1}/${maxRetries}...`
         );
         await sleep(delay);
-        return checkReleaseForPost2015Versions(client, releaseId, artist, title, retryCount + 1);
+        return checkReleaseForPostMinYearVersions(client, releaseId, artist, title, retryCount + 1);
       }
       throw error;
     }
 
     const versions = masterVersionsResponse.data.versions || [];
 
-    // Filter for releases from 2015 onwards (2015 included)
-    const post2015Releases = versions
+    // Filter for releases from MIN_YEAR onwards (MIN_YEAR included)
+    const postMinYearReleases = versions
       .filter((version) => {
         // Check both year (number) and released (string date) fields
         const year = (version as any).year;
         const released = (version as any).released;
 
         if (year && typeof year === "number") {
-          return year >= 2015;
+          return year >= MIN_YEAR;
         }
 
         // If released is a string, try to extract year
@@ -213,7 +223,7 @@ const checkReleaseForPost2015Versions = async (
           const yearMatch = released.match(/(\d{4})/);
           if (yearMatch) {
             const extractedYear = parseInt(yearMatch[1], 10);
-            return extractedYear >= 2015;
+            return extractedYear >= MIN_YEAR;
           }
         }
 
@@ -235,7 +245,7 @@ const checkReleaseForPost2015Versions = async (
 
         return {
           id: version.id,
-          title: (version as any).title || "Unknown",
+          title: (version as any).title || DEFAULTS.TITLE,
           year: releaseYear,
           url: `https://www.discogs.com/release/${version.id}`,
         };
@@ -245,8 +255,8 @@ const checkReleaseForPost2015Versions = async (
       releaseId,
       artist,
       title,
-      hasPost2015Release: post2015Releases.length > 0,
-      post2015Releases,
+      hasPostMinYearRelease: postMinYearReleases.length > 0,
+      postMinYearReleases,
     };
   } catch (error: any) {
     if (error.statusCode === 429 && retryCount < maxRetries) {
@@ -255,7 +265,7 @@ const checkReleaseForPost2015Versions = async (
         `⚠️  Rate limit hit for release ${releaseId}. Waiting ${delay / 1000}s before retry ${retryCount + 1}/${maxRetries}...`
       );
       await sleep(delay);
-      return checkReleaseForPost2015Versions(client, releaseId, artist, title, retryCount + 1);
+      return checkReleaseForPostMinYearVersions(client, releaseId, artist, title, retryCount + 1);
     }
 
     console.error(`Error checking release ${releaseId}:`, error.message || error);
@@ -264,8 +274,8 @@ const checkReleaseForPost2015Versions = async (
       releaseId,
       artist,
       title,
-      hasPost2015Release: false,
-      post2015Releases: [],
+      hasPostMinYearRelease: false,
+      postMinYearReleases: [],
     };
   }
 };
@@ -288,8 +298,8 @@ const extractReleaseIds = (rows: CsvRow[]): Array<{ id: number; artist: string; 
     if (!isNaN(releaseId) && releaseId > 0) {
       releaseIds.push({
         id: releaseId,
-        artist: row.Artist || "Unknown",
-        title: row.Title || "Unknown",
+        artist: row.Artist || DEFAULTS.ARTIST,
+        title: row.Title || DEFAULTS.TITLE,
       });
     }
   }
@@ -307,27 +317,19 @@ const escapeCsvField = (field: string | number): string => {
 };
 
 const writeResultsToCsv = (results: ReleaseInfo[], outputPath: string): void => {
-  const headers = [
-    "Original Artist",
-    "Original Title",
-    "Original Release ID",
-    "2015+ Release Year",
-    "2015+ Release Title",
-    "2015+ Release ID",
-    "2015+ Release URL",
-  ];
+  const headers = CSV_OUTPUT.getHeaders();
 
   const csvRows: string[] = [headers.map(escapeCsvField).join(",")];
 
   for (const result of results) {
-    if (result.post2015Releases.length === 0) {
+    if (result.postMinYearReleases.length === 0) {
       continue;
     }
 
-    for (const release of result.post2015Releases) {
+    for (const release of result.postMinYearReleases) {
       const row = [
-        result.artist || "Unknown",
-        result.title || "Unknown",
+        result.artist || DEFAULTS.ARTIST,
+        result.title || DEFAULTS.TITLE,
         result.releaseId,
         release.year,
         release.title,
@@ -345,11 +347,12 @@ const writeResultsToCsv = (results: ReleaseInfo[], outputPath: string): void => 
 const generateOutputFilename = (): string => {
   const now = new Date();
   const timestamp = now.toISOString().replace(/[:.]/g, "-").slice(0, -5); // Format: 2024-01-15T10-30-45
-  return `wantlist-results-${timestamp}.csv`;
+  return `${CSV_OUTPUT.FILENAME_PREFIX}${timestamp}.csv`;
 };
 
 const main = async () => {
-  const csvPath = process.argv[2] || join(process.cwd(), "wantlist.csv");
+  // Allow override via command line argument, otherwise use the constant
+  const csvPath = process.argv[2] || WANTLIST_CSV_PATH;
 
   console.log(`Reading CSV file: ${csvPath}`);
 
@@ -366,10 +369,14 @@ const main = async () => {
 
   const client = getClient();
   const results: ReleaseInfo[] = [];
-  const releasesWithPost2015: ReleaseInfo[] = [];
+  const releasesWithPostMinYear: ReleaseInfo[] = [];
+
+  const maxRequestsPerMin = isAuthenticated
+    ? RATE_LIMIT.AUTHENTICATED_REQUESTS_PER_MINUTE
+    : RATE_LIMIT.UNAUTHENTICATED_REQUESTS_PER_MINUTE;
 
   console.log(
-    `\nRate limit: ${isAuthenticated ? "60" : "25"} requests/minute (60-second sliding window)\n`
+    `\nRate limit: ${maxRequestsPerMin} requests/minute (${RATE_LIMIT.WINDOW_MS / 1000}-second sliding window)\n`
   );
 
   const startTime = Date.now();
@@ -377,46 +384,46 @@ const main = async () => {
   for (let i = 0; i < releaseIds.length; i++) {
     const { id, artist, title } = releaseIds[i];
 
-    if (i > 0 && i % 10 === 0) {
+    if (i > 0 && i % PROGRESS.REPORT_INTERVAL === 0) {
       const elapsed = Math.floor((Date.now() - startTime) / 1000 / 60);
       const requestsInWindow = rateLimiter.getRequestsInWindow();
       const remaining = rateLimiter.getRemaining();
       console.log(
-        `Processed ${i}/${releaseIds.length} releases... (${elapsed} min elapsed, ${requestsInWindow}/${isAuthenticated ? 60 : 25} requests in window, ${remaining} remaining)`
+        `Processed ${i}/${releaseIds.length} releases... (${elapsed} min elapsed, ${requestsInWindow}/${maxRequestsPerMin} requests in window, ${remaining} remaining)`
       );
     }
 
-    const result = await checkReleaseForPost2015Versions(client, id, artist, title);
+    const result = await checkReleaseForPostMinYearVersions(client, id, artist, title);
     results.push(result);
 
-    if (result.hasPost2015Release) {
-      releasesWithPost2015.push(result);
+    if (result.hasPostMinYearRelease) {
+      releasesWithPostMinYear.push(result);
     }
   }
 
   console.log(`\n\n=== Results ===`);
   console.log(`Total releases processed: ${results.length}`);
-  console.log(`Releases with 2015+ versions: ${releasesWithPost2015.length}\n`);
+  console.log(`Releases with ${MIN_YEAR}+ versions: ${releasesWithPostMinYear.length}\n`);
 
-  if (releasesWithPost2015.length > 0) {
+  if (releasesWithPostMinYear.length > 0) {
     // Write results to CSV
     const outputFilename = generateOutputFilename();
     const outputPath = join(process.cwd(), outputFilename);
-    writeResultsToCsv(releasesWithPost2015, outputPath);
+    writeResultsToCsv(releasesWithPostMinYear, outputPath);
     console.log(`✅ Results saved to: ${outputFilename}\n`);
 
-    console.log("Releases with 2015+ versions:\n");
-    releasesWithPost2015.forEach((result) => {
+    console.log(`Releases with ${MIN_YEAR}+ versions:\n`);
+    releasesWithPostMinYear.forEach((result) => {
       console.log(`\n${result.artist} - ${result.title}`);
       console.log(`  Release ID: ${result.releaseId}`);
-      console.log(`  2015+ releases (${result.post2015Releases.length}):`);
-      result.post2015Releases.forEach((release) => {
+      console.log(`  ${MIN_YEAR}+ releases (${result.postMinYearReleases.length}):`);
+      result.postMinYearReleases.forEach((release) => {
         console.log(`    - [${release.year}] ${release.title} (ID: ${release.id})`);
         console.log(`      URL: ${release.url}`);
       });
     });
   } else {
-    console.log("No releases found with 2015+ versions.");
+    console.log(`No releases found with ${MIN_YEAR}+ versions.`);
   }
 };
 
